@@ -1,3 +1,6 @@
+# ── Secrets — NEVER commit these ──
+.env
+
 # ── Markdown files (docs kept local, not in repo) ──
 *.md
 
@@ -24,3 +27,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+.gitignore
