@@ -1,0 +1,26 @@
+# ── Markdown files (docs kept local, not in repo) ──
+*.md
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ──
+env/
+venv/
+.venv/
+
+# ── Output / generated files ──
+output/
+
+# ── OS junk ──
+.DS_Store
+Thumbs.db
+
+# ── IDEs ──
+.vscode/
+.idea/
+*.swp
