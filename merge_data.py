@@ -1,34 +1,3 @@
-"""
-merge_data.py — Step 2: Entity matching and PostgreSQL loading for ConsultBae merge project.
-
-Reads the three cleaned CSVs produced by clean_data.py and:
-  1. Connects to a hosted PostgreSQL database (Render).
-  2. Creates one raw table per source for traceability.
-  3. Runs Option-C entity matching (phone OR email) to identify the same person
-     across files — no single ID is shared, so we infer identity from normalized keys.
-  4. Builds a `persons` master table — one row per real person.
-  5. Builds a `person_sources` link table recording which source(s) contributed.
-
-Switched from SQLite → PostgreSQL because:
-  - SQLite is a local file; it cannot be shared between a local pipeline and a
-    deployed FastAPI app on Render without committing the file to git (fragile).
-  - PostgreSQL on Render is a hosted server — both this script (local) and the
-    Task 3 FastAPI app (Render) connect to it via the same DATABASE_URL.
-  - PostgreSQL handles concurrent writes (multiple audio submissions at once)
-    without the single-writer lock that SQLite has.
-
-Key syntax changes from SQLite:
-  - AUTOINCREMENT → SERIAL (Postgres auto-increment)
-  - INTEGER (0/1 booleans) → BOOLEAN (native Postgres type)
-  - Placeholder ? → %s  (psycopg2 uses %s, not ?)
-  - executescript() → individual execute() calls (psycopg2 has no executescript)
-  - PRAGMA → removed (SQLite-only directive)
-  - pandas .to_sql() → requires SQLAlchemy engine, not a raw psycopg2 connection
-
-DATABASE_URL is read from the DATABASE_URL environment variable first.
-Falls back to the hardcoded Render URL for local dev convenience.
-In production / CI, always set the env var — never hardcode credentials in code.
-"""
 
 import os
 import psycopg2
@@ -177,24 +146,27 @@ def create_schema(conn):
         )
     """)
 
-    # Master merged persons table — one row per real person
+    # Master merged persons table — one row per real person.
+    # matched_source_count: how many of the 3 source files this person was
+    # found in (1, 2, or 3) — computed after all matching passes finish.
     cur.execute("""
         CREATE TABLE persons (
-            person_id          SERIAL PRIMARY KEY,
-            full_name          TEXT,
-            email              TEXT,
-            phone              TEXT,
-            city               TEXT,
-            experience_years   REAL,
-            ctc_lakhs          REAL,
-            applied_date       TEXT,
-            skills             TEXT,
-            rate_value         REAL,
-            rate_unit          TEXT,
-            status             TEXT,
-            verified           BOOLEAN,
-            projects_completed INTEGER,
-            sources            TEXT
+            person_id            SERIAL PRIMARY KEY,
+            full_name            TEXT,
+            email                TEXT,
+            phone                TEXT,
+            city                 TEXT,
+            experience_years     REAL,
+            ctc_lakhs            REAL,
+            applied_date         TEXT,
+            skills               TEXT,
+            rate_value           REAL,
+            rate_unit            TEXT,
+            status               TEXT,
+            verified             BOOLEAN,
+            projects_completed   INTEGER,
+            sources              TEXT,
+            matched_source_count INTEGER
         )
     """)
 
@@ -253,6 +225,10 @@ def build_persons(conn, df1, df2, df3):
             if pid_phone == pid_email:
                 return pid_phone, "phone+email"
             else:
+                # Phone says one existing person, email says a different one.
+                # We keep the existing behavior of trusting phone and moving on —
+                # this is just printed for visibility during a run, not persisted
+                # as a separate DB flag (see module docstring for why).
                 print(f"  ⚠️  CONFLICT: phone→person {pid_phone} but email→person {pid_email}. "
                       f"Trusting phone. (phone={phone}, email={email})")
                 return pid_phone, "phone"
@@ -367,6 +343,16 @@ def build_persons(conn, df1, df2, df3):
                                     "source_row_id": row_idx + 1, "match_key": key})
     print(f"    → {s3_new} new, {s3_matched} matched by phone")
 
+    # ── Compute matched_source_count now that all 3 passes are done ──
+    # Must happen after every pass — a person's final source set isn't
+    # complete until Source 3 has had its chance to match against it too.
+    # This is just len(sources) as an int (1, 2, or 3), stored as its own
+    # column so it's easy to filter/query later, e.g.
+    #   SELECT * FROM persons WHERE matched_source_count = 1;
+    # to see everyone who was only ever found in a single file.
+    for pid, p in persons.items():
+        p["matched_source_count"] = len(p["sources"])
+
     # ── Write to PostgreSQL ──
     cur = conn.cursor()
     persons_inserted = 0
@@ -376,8 +362,9 @@ def build_persons(conn, df1, df2, df3):
             INSERT INTO persons
               (person_id, full_name, email, phone, city,
                experience_years, ctc_lakhs, applied_date, skills,
-               rate_value, rate_unit, status, verified, projects_completed, sources)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               rate_value, rate_unit, status, verified, projects_completed,
+               sources, matched_source_count)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             pid, p["full_name"], p["email"], p["phone"], p["city"],
             p["experience_years"], p["ctc_lakhs"], p["applied_date"], p["skills"],
@@ -385,6 +372,7 @@ def build_persons(conn, df1, df2, df3):
             p["verified"],   # True/False/None — Postgres BOOLEAN handles this natively
             p["projects_completed"],
             ",".join(sorted(p["sources"])),
+            p["matched_source_count"],
         ))
         persons_inserted += 1
 
@@ -405,6 +393,18 @@ def print_summary(conn, persons_count, ps_rows):
     cur = conn.cursor()
     cur.execute("SELECT sources, COUNT(*) FROM persons GROUP BY sources ORDER BY sources")
     source_dist = cur.fetchall()
+
+    # Breakdown by how many files each person was matched from (1, 2, or 3) —
+    # replaces the old subjective 'high'/'conflict'/'needs_review' labeling
+    # with a plain, queryable fact.
+    cur.execute("""
+        SELECT matched_source_count, COUNT(*)
+        FROM persons
+        GROUP BY matched_source_count
+        ORDER BY matched_source_count
+    """)
+    count_dist = cur.fetchall()
+
     cur.execute("SELECT COUNT(*) FROM persons WHERE email IS NOT NULL AND phone IS NOT NULL")
     both_keys = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM persons WHERE email IS NULL")
@@ -425,6 +425,10 @@ def print_summary(conn, persons_count, ps_rows):
     print("  Persons by source combination:")
     for sources_val, count in source_dist:
         print(f"    {sources_val:<12} : {count} persons")
+    print()
+    print("  Persons by matched_source_count (# of files matched from):")
+    for n, count in count_dist:
+        print(f"    {n} file(s)     : {count} persons")
     print("─"*60)
     print(f"  Database: Render PostgreSQL\n")
 
