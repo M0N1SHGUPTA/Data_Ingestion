@@ -1,4 +1,4 @@
-# ConsultBae Data Ingestion Pipeline
+# Data Ingestion Pipeline
 
 This project is a data engineering pipeline that cleans and merges candidate/worker data from three disparate sources (Naukri applicants, Gig workers, and CBNexus contacts) into a unified PostgreSQL database.
 
